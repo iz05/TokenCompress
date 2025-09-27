@@ -33,8 +33,10 @@ import torch.nn.functional as F
 import torch.utils.checkpoint
 from torch.nn import CrossEntropyLoss, LayerNorm, MSELoss
 
+from transformers import PretrainedConfig
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, StaticCache, DynamicCache
+from transformers.generation.utils import GenerationMixin
 from transformers.modeling_attn_mask_utils import (
     AttentionMaskConverter,
 )
@@ -55,6 +57,9 @@ from transformers.utils import (
 )
 from .configuration_qwen2_vl import Qwen2VLConfig, Qwen2VLVisionConfig
 
+# hack to not use flash attn, since NVIDIA RTX PRO 6000 doesn't support
+def is_flash_attn_2_available():
+    return False
 
 if is_flash_attn_2_available():
     from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input  # noqa
@@ -67,6 +72,70 @@ else:
     flash_attn_varlen_func = None
     flash_attn_func = None
     _flash_supports_window_size = False
+
+
+# hack for not being able to use flash attention
+def _fake_flash_attention_forward(
+    query_states: torch.Tensor,
+    key_states: torch.Tensor,
+    value_states: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    query_length: int,
+    is_causal: bool,
+    dropout: float = 0.0,
+    position_ids: Optional[torch.Tensor] = None,
+    softmax_scale: Optional[float] = None,
+    sliding_window: Optional[int] = None,
+    use_top_left_mask: bool = False,
+    softcap: Optional[float] = None,
+    deterministic: Optional[bool] = None,
+    cu_seq_lens_q: Optional[torch.LongTensor] = None,
+    cu_seq_lens_k: Optional[torch.LongTensor] = None,
+    max_length_q: Optional[int] = None,
+    max_length_k: Optional[int] = None,
+    target_dtype: Optional[torch.dtype] = None,
+    implementation: Optional[str] = None,
+    **kwargs,
+):
+
+    """
+    Fake FlashAttention for compatibility.
+    Ensures output shape [B, S, hidden_size] without changing other code.
+    """
+
+    """
+    Fake FlashAttention that is compatible with standard multi-head attention.
+    Expects query/key/value shaped [batch, seq_len, num_heads, head_dim].
+    Returns [batch, seq_len, hidden_size].
+    """
+    bsz, seq_len, num_heads, head_dim = query_states.shape
+    hidden_size = num_heads * head_dim
+
+    # Compute scaled dot-product attention
+    attn_scores = torch.einsum("bqhd,bkhd->bhqk", query_states, key_states) / (head_dim ** 0.5)
+
+    # Apply attention mask if provided
+    if attention_mask is not None:
+        # attention_mask: [batch, 1, 1, seq_len] or broadcastable
+        attn_scores = attn_scores.masked_fill(attention_mask == 0, float("-inf"))
+
+    # Apply causal mask if needed
+    if is_causal:
+        causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=query_states.device), diagonal=1).bool()
+        attn_scores = attn_scores.masked_fill(causal_mask, float("-inf"))
+
+    # Softmax to get attention probabilities
+    attn_probs = F.softmax(attn_scores, dim=-1)
+
+    # Apply dropout if needed
+    if dropout > 0.0:
+        attn_probs = F.dropout(attn_probs, p=dropout, training=True)
+
+    # Attention output
+    attn_output = torch.einsum("bhqk,bkhd->bqhd", attn_probs, value_states)
+
+    return attn_output
+
 
 # mamba utils
 from .mamba2_block import Mamba2Block, _init_weights
@@ -130,7 +199,7 @@ class CrossAttentionCache(Cache):
     """
 
     def __init__(self) -> None:
-        super().__init__()
+        super().__init__(layer_class_to_replicate=Qwen2VLDecoderLayer)
         self.key_cache: List[torch.Tensor] = []
         self.value_cache: List[torch.Tensor] = []
 
@@ -318,18 +387,27 @@ class Qwen2VLRotaryEmbedding(nn.Module):
                 "`Qwen2VLRotaryEmbedding` can now be fully parameterized by passing the model config through the "
                 "`config` argument. All other arguments will be removed in v4.46"
             )
-            self.rope_kwargs = {
+
+            self.rope_config = PretrainedConfig.from_dict({
                 "rope_type": rope_type,
                 "factor": scaling_factor,
                 "dim": dim,
                 "base": base,
                 "max_position_embeddings": max_position_embeddings,
-            }
+
+                # required for new transformers package
+                "rope_theta": base,
+                "head_dim": dim,
+                "partial_rotary_factor": 1.0,
+            })
+
             self.rope_type = rope_type
             self.max_seq_len_cached = max_position_embeddings
             self.original_max_seq_len = max_position_embeddings
         else:
             # BC: "rope_type" was originally "type"
+            self.rope_config = config
+
             if config.rope_scaling is not None:
                 self.rope_type = config.rope_scaling.get("rope_type", config.rope_scaling.get("type"))
             else:
@@ -340,7 +418,7 @@ class Qwen2VLRotaryEmbedding(nn.Module):
         self.config = config
         self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
 
-        inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device, **self.rope_kwargs)
+        inv_freq, self.attention_scaling = self.rope_init_fn(self.rope_config, device)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self.original_inv_freq = self.inv_freq
 
@@ -582,9 +660,21 @@ class VisionFlashAttention2(nn.Module):
         k = apply_rotary_pos_emb_vision(k.unsqueeze(0), rotary_pos_emb).squeeze(0)
 
         max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
-        attn_output = flash_attn_varlen_func(q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen).reshape(
-            seq_length, -1
-        )
+        # attn_output = flash_attn_varlen_func(q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen).reshape(
+        #     seq_length, -1
+        # )
+
+        # q, k, v: [seq_len, batch, head_dim] or [batch, seq_len, head_dim] depending on your code
+        # Make sure your dimensions match your original implementation
+        attn_scores = torch.matmul(q, k.transpose(-2, -1))  # [seq_len, seq_len] for each batch
+        attn_scores = attn_scores / (q.size(-1) ** 0.5)      # scale by sqrt(head_dim)
+
+        attn_probs = torch.softmax(attn_scores, dim=-1)      # softmax over keys
+        attn_output = torch.matmul(attn_probs, v)           # apply attention to values
+
+        # reshape if needed
+        attn_output = attn_output.reshape(seq_length, -1)
+
         attn_output = self.proj(attn_output)
         return attn_output
 
@@ -923,7 +1013,7 @@ class Qwen2VLFlashAttention2(Qwen2VLAttention):
                     "for auto-regressive decoding with k/v caching, please make sure to initialize the attention class "
                     "with a layer index."
                 )
-            kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+            kv_seq_len += past_key_value.get_seq_length()
 
         # Because the input can be padded, the absolute sequence length depends on the max position id.
         if position_embeddings is None:
@@ -1017,7 +1107,7 @@ class Qwen2VLFlashAttention2(Qwen2VLAttention):
                 fa2_position_ids = position_ids[0, :]
             else:
                 fa2_position_ids = position_ids
-            attn_output = _flash_attention_forward(
+            attn_output = _fake_flash_attention_forward(
                 query_states,
                 key_states,
                 value_states,
@@ -1028,9 +1118,11 @@ class Qwen2VLFlashAttention2(Qwen2VLAttention):
                 sliding_window=sliding_window,
                 is_causal=self.is_causal,
                 use_top_left_mask=self._flash_attn_uses_top_left_mask,
+                hidden_size=self.hidden_size,
+                num_heads=self.num_heads
             )
         else:
-            attn_output = _flash_attention_forward(
+            attn_output = _fake_flash_attention_forward(
                 query_states,
                 key_states,
                 value_states,
@@ -1040,6 +1132,8 @@ class Qwen2VLFlashAttention2(Qwen2VLAttention):
                 sliding_window=sliding_window,
                 is_causal=self.is_causal,
                 use_top_left_mask=self._flash_attn_uses_top_left_mask,
+                hidden_size=self.hidden_size,
+                num_heads=self.num_heads
             )
 
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size).contiguous()
@@ -2252,7 +2346,7 @@ QWEN2_VL_INPUTS_DOCSTRING = r"""
 """
 
 # QWen2VL model
-class Qwen2VLForConditionalGeneration(Qwen2VLPreTrainedModel):
+class Qwen2VLForConditionalGeneration(Qwen2VLPreTrainedModel, GenerationMixin):
     _tied_weights_keys = ["lm_head.weight"]
     # for HfMultiTaskTrainer
     supports_report_metrics: bool = True

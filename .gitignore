@@ -166,3 +166,8 @@ wandb
 
 # Conda environment
 Miniconda3-latest-MacOSX-arm64.sh
+
+mamba/
+causal-conv1d/
+mamba
+causal-conv1d
